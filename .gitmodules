@@ -1,0 +1,6 @@
+[submodule "transformers"]
+	path = transformers
+	url = ./transformers
+[submodule "peft"]
+	path = peft
+	url = ./peft

@@ -18,7 +18,14 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence
 
 import torch
+import torch.distributed as dist
 import transformers
+
+# from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
+# replace_llama_attn_with_flash_attn()
+
+from peft import LoraConfig, TaskType, get_peft_model
+
 from torch.utils.data import Dataset
 from transformers import Trainer
 
@@ -46,6 +53,22 @@ PROMPT_DICT = {
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    use_lora: bool = field(
+        default=False,
+        metadata={"help": "Whether to lora."},
+    )
+    lora_r: int = field(
+        default=8,
+        metadata={"help": "the rank of the lora parameters. The smaller lora_r is , the fewer parameters lora has."},
+    )
+    lora_alpha: int = field(
+        default=32,
+        metadata={"help": "Merging ratio between the fine-tuned model and the original. This is controlled by a parameter called alpha in the paper."},
+    )
+    lora_dropout: float = field(
+        default=0.1,
+        metadata={"help": "The dropout rate in lora.linear."},
+    )
 
 
 @dataclass
@@ -193,12 +216,18 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
+    model = transformers.LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-    )
+    ) 
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+    if model_args.use_lora:
+        logging.warning("Using LoRA...")
+        peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, inference_mode=False, r=model_args.lora_r, target_modules=["q_proj","v_proj"], lora_alpha=model_args.lora_alpha, lora_dropout=model_args.lora_dropout)
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+
+    tokenizer = transformers.LlamaTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
@@ -223,8 +252,19 @@ def train():
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     trainer.train()
-    trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    if model_args.use_lora:
+        # Save Adapter 
+        if trainer.is_world_process_zero(): 
+            model.save_pretrained(training_args.output_dir)
+    else:
+        trainer.save_model() 
+        if trainer.is_world_process_zero(): 
+            tokenizer.save_pretrained(training_args.output_dir)
+
 
 
 if __name__ == "__main__":
