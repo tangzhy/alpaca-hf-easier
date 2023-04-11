@@ -40,19 +40,6 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "</s>"
 DEFAULT_UNK_TOKEN = "</s>"
-PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
-    ),
-}
-
 
 @dataclass
 class ModelArguments:
@@ -96,25 +83,10 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     max_new_tokens: int = field(
-        default=128,
+        default=100,
     )
     temperature: float = field(
-        default=0.1,
-    )
-    top_p: float = field(
-        default=0.75,
-    )
-    top_k: int = field(
-        default=40,
-    )
-    num_beams: int = field(
-        default=4,
-    )
-    do_sample: bool = field(
-        default=False,
-    )
-    repetition_penalty: float = field(
-        default=1.0,
+        default=0.0,
     )
 
 
@@ -206,11 +178,7 @@ class PredictDataset(Dataset):
         list_data_dict = utils.jload(data_path)
 
         logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-        sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
+        sources = [example.get("input", "") for example in list_data_dict]
 
         logging.warning("Tokenizing inputs... This may take some time...")
         input_list = preprocess4predict(sources, tokenizer)
@@ -222,7 +190,7 @@ class PredictDataset(Dataset):
 
     def __getitem__(self, i):
         item = self.ds[i]
-        item["input_ids"] = torch.tensor(item["input_ids"], dtype=torch.int32).view(1, -1)
+        item["input_ids"] = torch.tensor(item["input_ids"], dtype=torch.int32)
         return item
 
 class SupervisedDataset(Dataset):
@@ -234,11 +202,7 @@ class SupervisedDataset(Dataset):
         list_data_dict = utils.jload(data_path)
 
         logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-        sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-            for example in list_data_dict
-        ]
+        sources = [example.get("input", "") for example in list_data_dict]
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
 
         logging.warning("Tokenizing inputs... This may take some time...")
@@ -271,6 +235,25 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
+
+@dataclass
+class DataCollatorForPredictDataset(object):
+    """Collate examples for supervised fine-tuning."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        inputs = [instance["input"] for instance in instances]
+        input_ids = [instance["input_ids"] for instance in instances]
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        return dict(
+            inputs=inputs, 
+            input_ids=input_ids,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
@@ -377,21 +360,30 @@ def driver():
 
         predict_dataset = PredictDataset(tokenizer=tokenizer, data_path=data_args.data_path)
         predict_dataset.ds = predict_dataset.ds.shard(training_args.world_size, training_args.local_rank) 
-        pbar = tqdm(predict_dataset, desc="Predicting...") if training_args.local_rank in [-1, 0] else predict_dataset 
+        predict_dataloader = DataLoader( 
+                predict_dataset, 
+                batch_size=training_args.per_device_eval_batch_size, 
+                collate_fn=DataCollatorForPredictDataset(tokenizer=tokenizer),
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=training_args.dataloader_num_workers,
+            ) 
+        pbar = tqdm(predict_dataloader, desc="Predicting...") if training_args.local_rank in [-1, 0] else predict_dataloader 
 
         fw = open(os.path.join(training_args.output_dir, f"part-{training_args.local_rank}.json"), "w")
         with torch.cuda.amp.autocast() if training_args.fp16 else nullcontext():
-            for entry in pbar: 
-                inputs = entry.pop("input")
+            for batch in pbar: 
+                inputs = batch.pop("inputs")
                 with torch.no_grad(): 
-                    for k, v in entry.items():
-                        entry[k] = v.to(training_args.device)
-                    generate_ids = model.generate(**entry, max_new_tokens=training_args.max_new_tokens, top_p=training_args.top_p, top_k=training_args.top_k, num_beams=training_args.num_beams, synced_gpus=True, pad_token_id=tokenizer.eos_token_id)
-                    generate_texts = tokenizer.decode(generate_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                    inp_len = len(inputs)
-                    o = {"input": inputs, "generate": generate_texts[inp_len:]}
-                    o = json.dumps(o, ensure_ascii=False)
-                    fw.write(o + "\n")
+                    for k, v in batch.items():
+                        batch[k] = v.to(training_args.device)
+                    generate_ids = model.generate(**batch, max_new_tokens=training_args.max_new_tokens, temperature=training_args.temperature, synced_gpus=True, pad_token_id=tokenizer.eos_token_id)
+                    generate_texts = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    for inp, gen in zip(inputs, generate_texts):
+                        inp_len = len(inp)
+                        o = {"input": inp, "generate": gen[inp_len:]}
+                        o = json.dumps(o, ensure_ascii=False)
+                        fw.write(o + "\n")
         fw.close()
 
         if dist.is_initialized():
@@ -439,21 +431,30 @@ def driver():
 
         predict_dataset = PredictDataset(tokenizer=tokenizer, data_path=data_args.data_path)
         predict_dataset.ds = predict_dataset.ds.shard(training_args.world_size, training_args.local_rank) 
-        pbar = tqdm(predict_dataset, desc="Predicting...") if training_args.local_rank in [-1, 0] else predict_dataset 
+        predict_dataloader = DataLoader( 
+                predict_dataset, 
+                batch_size=training_args.per_device_eval_batch_size, 
+                collate_fn=DataCollatorForPredictDataset(tokenizer=tokenizer),
+                shuffle=False, 
+                drop_last=False, 
+                num_workers=training_args.dataloader_num_workers,
+            ) 
+        pbar = tqdm(predict_dataloader, desc="Predicting...") if training_args.local_rank in [-1, 0] else predict_dataloader 
 
         fw = open(os.path.join(training_args.output_dir, f"part-{training_args.local_rank}.json"), "w")
         with torch.cuda.amp.autocast() if training_args.fp16 else nullcontext():
-            for entry in pbar: 
-                inputs = entry.pop("input")
+            for batch in pbar: 
+                inputs = batch.pop("inputs")
                 with torch.no_grad(): 
-                    for k, v in entry.items():
-                        entry[k] = v.to(training_args.device)
-                    generate_ids = model.generate(**entry, max_new_tokens=training_args.max_new_tokens, top_p=training_args.top_p, top_k=training_args.top_k, num_beams=training_args.num_beams, synced_gpus=True, pad_token_id=tokenizer.eos_token_id)
-                    generate_texts = tokenizer.decode(generate_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                    inp_len = len(inputs)
-                    o = {"input": inputs, "generate": generate_texts[inp_len:]}
-                    o = json.dumps(o, ensure_ascii=False)
-                    fw.write(o + "\n")
+                    for k, v in batch.items():
+                        batch[k] = v.to(training_args.device)
+                    generate_ids = model.generate(**batch, max_new_tokens=training_args.max_new_tokens, temperature=training_args.temperature, synced_gpus=True, pad_token_id=tokenizer.eos_token_id)
+                    generate_texts = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    for inp, gen in zip(inputs, generate_texts):
+                        inp_len = len(inp)
+                        o = {"input": inp, "generate": gen[inp_len:]}
+                        o = json.dumps(o, ensure_ascii=False)
+                        fw.write(o + "\n")
         fw.close()
 
         if dist.is_initialized():
